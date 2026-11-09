@@ -222,23 +222,18 @@ func (s *Store) DistrictChain(id int) (District, City, Province, bool) {
 }
 
 // Search returns subdistricts whose label contains q (case-insensitive),
-// in ascending ID order, after applying offset and limit.
+// in ascending ID order, after applying offset and limit. An offset past the
+// end of the matches is clamped so the last page of results is returned.
 func (s *Store) Search(q string, limit, offset int) []Subdistrict {
 	q = strings.ToLower(strings.TrimSpace(q))
-	var out []Subdistrict
-	skipped := 0
+	var matches []Subdistrict
 	for i := 1; i < len(s.Subdistricts); i++ {
-		if !strings.Contains(s.Subdistricts[i].labelLower, q) {
-			continue
-		}
-		if skipped < offset {
-			skipped++
-			continue
-		}
-		out = append(out, s.Subdistricts[i])
-		if len(out) >= limit {
-			break
+		if strings.Contains(s.Subdistricts[i].labelLower, q) {
+			matches = append(matches, s.Subdistricts[i])
 		}
 	}
-	return out
+	if offset >= len(matches) {
+		offset = max(0, len(matches)-limit)
+	}
+	return matches[offset:min(len(matches), offset+limit)]
 }
