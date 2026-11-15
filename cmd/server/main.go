@@ -25,10 +25,13 @@ func main() {
 	if *healthcheck {
 		os.Exit(probe(port))
 	}
-	store, err := wilayah.Load()
+	// WILAYAH_DB makes the unpacked SQLite file persistent (reused across restarts);
+	// unset, a temp file is used and deleted on exit.
+	store, err := wilayah.Open(os.Getenv("WILAYAH_DB"))
 	if err != nil {
 		log.Fatalf("load data: %v", err)
 	}
+	defer store.Close()
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           api.NewHandler(store, os.Getenv("RAJAONGKIR_API_KEY")),
@@ -44,7 +47,7 @@ func main() {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	log.Printf("shippingking listening on http://localhost:%s (%d subdistricts)", port, len(store.Subdistricts)-1)
+	log.Printf("shippingking listening on http://localhost:%s (%d subdistricts)", port, store.SubdistrictCount())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

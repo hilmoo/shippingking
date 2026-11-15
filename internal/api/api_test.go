@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +14,14 @@ import (
 )
 
 var testStore *wilayah.Store
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if testStore != nil {
+		testStore.Close()
+	}
+	os.Exit(code)
+}
 
 func handler(t *testing.T, apiKey string) http.Handler {
 	t.Helper()

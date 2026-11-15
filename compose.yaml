@@ -7,10 +7,26 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
-      RAJAONGKIR_API_KEY: ${RAJAONGKIR_API_KEY}
+      # Optional; leave unset to disable API-key auth.
+      RAJAONGKIR_API_KEY: ${RAJAONGKIR_API_KEY:-}
+      # SQLite region DB, unpacked once onto the volume and reused on restart
+      # (re-unpacked automatically when a new image ships a newer dataset).
+      WILAYAH_DB: /data/wilayah.db
+    volumes:
+      - shippingking-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp # SQLite scratch space
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "/server", "-healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 5s
       retries: 3
+
+volumes:
+  shippingking-data:

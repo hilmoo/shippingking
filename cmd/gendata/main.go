@@ -1,9 +1,12 @@
 // Command gendata converts the pinned wilayah SQL dumps into the compact
-// embedded dataset internal/wilayah/data/wilayah.csv.gz.
+// dataset internal/wilayah/data/wilayah.csv.gz and then builds the prebuilt,
+// FTS5-indexed SQLite database the server embeds (wilayah.db.gz plus its
+// wilayah.version stamp), so the server needs no startup indexing.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/csv"
 	"flag"
@@ -15,6 +18,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/hilmoo/shippingking/internal/wilayah"
 )
 
 const (
@@ -34,8 +39,16 @@ type source struct{ name, url string }
 
 func main() {
 	src := flag.String("src", "", "directory containing the three SQL files (otherwise downloaded)")
-	out := flag.String("out", "internal/wilayah/data/wilayah.csv.gz", "output file")
+	out := flag.String("out", "internal/wilayah/data/wilayah.csv.gz", "output CSV file")
+	fromCSV := flag.Bool("from-csv", false, "skip the SQL dumps and rebuild only the database from the existing -out CSV")
 	flag.Parse()
+
+	if *fromCSV {
+		if err := buildDB(*out); err != nil {
+			fatal("build db: %v", err)
+		}
+		return
+	}
 
 	sources := []source{
 		{"wilayah.sql", "https://raw.githubusercontent.com/cahyadsn/wilayah/" + wilayahSHA + "/db/wilayah.sql"},
@@ -148,6 +161,10 @@ func main() {
 		fatal("%v", err)
 	}
 
+	if err := buildDB(*out); err != nil {
+		fatal("build db: %v", err)
+	}
+
 	fmt.Printf("provinces=%d cities=%d districts=%d subdistricts=%d zips=%d\n",
 		counts[0], counts[1], counts[2], counts[3], len(zips))
 	for lvl, want := range expected {
@@ -155,6 +172,55 @@ func main() {
 			fmt.Fprintf(os.Stderr, "warning: level %d count %d, expected %d\n", lvl, counts[lvl], want)
 		}
 	}
+}
+
+// buildDB turns the CSV at csvPath into wilayah.db.gz and wilayah.version
+// next to it.
+func buildDB(csvPath string) error {
+	csvGz, err := os.ReadFile(csvPath)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(csvPath)
+	version := wilayah.DatasetVersion(csvGz)
+
+	tmp, err := os.MkdirTemp("", "gendata-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	dbPath := filepath.Join(tmp, "wilayah.db")
+	if err := wilayah.BuildDB(bytes.NewReader(csvGz), dbPath, version); err != nil {
+		return err
+	}
+	raw, err := os.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	st, _ := raw.Stat()
+
+	dbGz := filepath.Join(dir, "wilayah.db.gz")
+	f, err := os.Create(dbGz)
+	if err != nil {
+		return err
+	}
+	gz, _ := gzip.NewWriterLevel(f, gzip.BestCompression)
+	if _, err := io.Copy(gz, raw); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wilayah.version"), []byte(version+"\n"), 0o644); err != nil {
+		return err
+	}
+	gzSt, _ := os.Stat(dbGz)
+	fmt.Printf("db version=%s raw=%.1fMB gz=%.1fMB\n", version, float64(st.Size())/1e6, float64(gzSt.Size())/1e6)
+	return nil
 }
 
 func open(dir string, s source) (io.ReadCloser, error) {

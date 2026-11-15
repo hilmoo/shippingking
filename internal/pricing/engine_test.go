@@ -7,6 +7,16 @@ import (
 	"github.com/hilmoo/shippingking/internal/wilayah"
 )
 
+func loadStore(t *testing.T) *wilayah.Store {
+	t.Helper()
+	s, err := wilayah.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
 func cityLoc(t *testing.T, s *wilayah.Store, kode string, districtIdx int) Location {
 	t.Helper()
 	for _, c := range s.Cities[1:] {
@@ -35,10 +45,7 @@ func costs(t *testing.T, o, d Location, w int, couriers ...string) map[string]in
 }
 
 func TestGolden(t *testing.T) {
-	s, err := wilayah.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := loadStore(t)
 	o := cityLoc(t, s, "31.74", 0)
 	type row struct {
 		kode                   string
@@ -106,7 +113,7 @@ func TestWeightRounding(t *testing.T) {
 }
 
 func TestAvailabilityAndErrors(t *testing.T) {
-	s, _ := wilayah.Load()
+	s := loadStore(t)
 	o := cityLoc(t, s, "31.74", 0)
 	// SAME_DAY only within the same city.
 	if _, ok := costs(t, o, cityLoc(t, s, "31.74", 1), 1000, "anteraja")["anteraja SD"]; !ok {
@@ -125,7 +132,7 @@ func TestAvailabilityAndErrors(t *testing.T) {
 }
 
 func TestDeterministic(t *testing.T) {
-	s, _ := wilayah.Load()
+	s := loadStore(t)
 	o, d := cityLoc(t, s, "31.74", 0), cityLoc(t, s, "35.78", 0)
 	a, _ := Quote(o, d, 1234, []string{"jne", "tiki", "pos"})
 	b, _ := Quote(o, d, 1234, []string{"jne", "tiki", "pos"})

@@ -84,14 +84,17 @@ func (s *Server) subdistricts(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "Invalid district_id")
 		return
 	}
-	ids := s.store.SubdistrictsByDistrict[id]
-	if len(ids) == 0 {
+	subs, err := s.store.SubdistrictsOf(id)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+	if len(subs) == 0 {
 		fail(w, http.StatusNotFound, "Sub District Data not found")
 		return
 	}
-	items := make([]zipItem, 0, len(ids))
-	for _, sid := range ids {
-		sd := s.store.Subdistricts[sid]
+	items := make([]zipItem, 0, len(subs))
+	for _, sd := range subs {
 		items = append(items, zipItem{sd.ID, sd.Name, sd.Zip})
 	}
 	ok(w, "Success Get Sub District By District ID", items)
@@ -121,15 +124,21 @@ func (s *Server) domesticDestination(w http.ResponseWriter, r *http.Request) {
 		}
 		offset = n
 	}
-	found := s.store.Search(search, limit, offset)
+	found, err := s.store.Search(search, limit, offset)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
 	if len(found) == 0 {
 		fail(w, http.StatusNotFound, "Domestic Destinations Data not found")
 		return
 	}
 	items := make([]destItem, 0, len(found))
 	for _, f := range found {
-		sd, d, c, p, _ := s.store.Hierarchy(f.ID)
-		items = append(items, destItem{sd.ID, sd.Label, p.Name, c.Name, d.Name, sd.Name, sd.Zip})
+		d := s.store.Districts[f.DistrictID]
+		c := s.store.Cities[d.CityID]
+		p := s.store.Provinces[c.ProvinceID]
+		items = append(items, destItem{f.ID, f.Label, p.Name, c.Name, d.Name, f.Name, f.Zip})
 	}
 	ok(w, "Success Get Domestic Destinations", items)
 }

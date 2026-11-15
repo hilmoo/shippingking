@@ -1,21 +1,39 @@
-// Package wilayah loads the embedded Indonesian region dataset and exposes
-// in-memory indexes keyed by integer IDs (1-based per level).
+// Package wilayah serves the Indonesian region dataset from an embedded,
+// prebuilt SQLite database (see cmd/gendata). Provinces, cities and districts
+// (~8k rows) are kept in memory keyed by integer IDs (1-based per level); the
+// ~84k subdistricts and their substring search stay in SQLite behind an FTS5
+// trigram index so they cost no Go heap.
 package wilayah
 
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"database/sql"
 	_ "embed"
-	"encoding/csv"
-	"fmt"
+	"encoding/hex"
 	"io"
-	"sort"
-	"strconv"
+	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"unicode/utf8"
+
+	_ "modernc.org/sqlite"
 )
 
-//go:embed data/wilayah.csv.gz
-var embedded []byte
+//go:embed data/wilayah.db.gz
+var embeddedDB []byte
+
+//go:embed data/wilayah.version
+var embeddedVersion string
+
+// DatasetVersion derives the version stamp for a CSV dataset; gendata stores it
+// in the DB and wilayah.version, and Open uses it to validate persisted files.
+func DatasetVersion(csvGz []byte) string {
+	sum := sha256.Sum256(csvGz)
+	return schemaVersion + "-" + hex.EncodeToString(sum[:8])
+}
 
 type Province struct {
 	ID       int
@@ -42,170 +60,220 @@ type Subdistrict struct {
 	Kode, Name     string
 	Zip            string
 	Label          string
-	labelLower     string
 }
 
-// Store holds all regions. Slices are indexed by ID (index 0 is unused).
+// Store holds provinces/cities/districts in memory (slices indexed by ID,
+// index 0 unused) and subdistricts in SQLite. Call Close when done.
 type Store struct {
-	Provinces    []Province
-	Cities       []City
-	Districts    []District
-	Subdistricts []Subdistrict
+	Provinces []Province
+	Cities    []City
+	Districts []District
 
-	CitiesByProvince       map[int][]int
-	DistrictsByCity        map[int][]int
-	SubdistrictsByDistrict map[int][]int
+	CitiesByProvince map[int][]int
+	DistrictsByCity  map[int][]int
+
+	nSub    int
+	db      *sql.DB
+	dbPath  string
+	ownFile bool
+	byID    *sql.Stmt
+	byDist  *sql.Stmt
 }
 
-// Load builds a Store from the embedded dataset.
-func Load() (*Store, error) {
-	return LoadFrom(bytes.NewReader(embedded))
+// SubdistrictCount returns the number of subdistricts.
+func (s *Store) SubdistrictCount() int { return s.nSub }
+
+// Close releases the database; a temp-file database is also deleted.
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.ownFile {
+		_ = os.Remove(s.dbPath)
+	}
+	return err
 }
 
-// LoadFrom builds a Store from a gzip'd CSV stream (header kode,nama,lat,lng,zip).
-func LoadFrom(r io.Reader) (*Store, error) {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
+// Load opens the embedded dataset using a throwaway temp-file database.
+func Load() (*Store, error) { return Open("") }
+
+// Open opens the dataset at path. If path holds a database matching the
+// embedded dataset version it is reused as-is (no startup indexing);
+// otherwise the embedded database is unpacked there atomically. An empty path
+// unpacks into a temp file that Close deletes.
+func Open(path string) (*Store, error) {
+	want := strings.TrimSpace(embeddedVersion)
+	own := path == ""
+	if own {
+		f, err := os.CreateTemp("", "wilayah-*.db")
+		if err != nil {
+			return nil, err
+		}
+		path = f.Name()
+		f.Close()
+	} else if v, err := fileVersion(path); err == nil && v == want {
+		return openFile(path, false)
+	}
+	if err := unpack(path); err != nil {
+		if own {
+			os.Remove(path)
+		}
 		return nil, err
+	}
+	return openFile(path, own)
+}
+
+// fileVersion reads the dataset version stamped in a database file.
+func fileVersion(path string) (string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return "", err
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var v string
+	err = db.QueryRow(`SELECT value FROM meta WHERE key='version'`).Scan(&v)
+	return v, err
+}
+
+// unpack writes the embedded database to path via a temp file + rename.
+func unpack(path string) error {
+	gz, err := gzip.NewReader(bytes.NewReader(embeddedDB))
+	if err != nil {
+		return err
 	}
 	defer gz.Close()
-	cr := csv.NewReader(gz)
-	if _, err := cr.Read(); err != nil { // header
-		return nil, err
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
 	}
-	rows, err := cr.ReadAll()
+	_, err = io.Copy(tmp, gz)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+func openFile(path string, own bool) (_ *Store, err error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=cache_size(-2048)&_pragma=temp_store(FILE)")
 	if err != nil {
 		return nil, err
 	}
-
+	db.SetMaxOpenConns(4)
 	s := &Store{
-		Provinces:              []Province{{}},
-		Cities:                 []City{{}},
-		Districts:              []District{{}},
-		Subdistricts:           []Subdistrict{{}},
-		CitiesByProvince:       map[int][]int{},
-		DistrictsByCity:        map[int][]int{},
-		SubdistrictsByDistrict: map[int][]int{},
+		Provinces:        []Province{{}},
+		Cities:           []City{{}},
+		Districts:        []District{{}},
+		CitiesByProvince: map[int][]int{},
+		DistrictsByCity:  map[int][]int{},
+		db:               db, dbPath: path, ownFile: own,
 	}
-	// Rows are sorted by kode, so parents always precede children.
-	provByKode := map[string]int{}
-	cityByKode := map[string]int{}
-	distByKode := map[string]int{}
+	defer func() {
+		if err != nil {
+			s.Close()
+		}
+	}()
 
-	for _, row := range rows {
-		if len(row) < 5 {
-			return nil, fmt.Errorf("bad row %v", row)
+	rows, err := db.Query(`SELECT id,kode,name,lat,lng FROM province ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var p Province
+		if err = rows.Scan(&p.ID, &p.Kode, &p.Name, &p.Lat, &p.Lng); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		kode, name, zip := row[0], strings.ToUpper(row[1]), row[4]
-		lat, _ := strconv.ParseFloat(row[2], 64)
-		lng, _ := strconv.ParseFloat(row[3], 64)
-		switch strings.Count(kode, ".") {
-		case 0:
-			id := len(s.Provinces)
-			s.Provinces = append(s.Provinces, Province{ID: id, Kode: kode, Name: name, Lat: lat, Lng: lng})
-			provByKode[kode] = id
-		case 1:
-			pid, ok := provByKode[parent(kode)]
-			if !ok {
-				return nil, fmt.Errorf("orphan city %s", kode)
-			}
-			id := len(s.Cities)
-			c := City{ID: id, ProvinceID: pid, Kode: kode, Name: name, Lat: lat, Lng: lng}
-			if lat == 0 && lng == 0 {
-				c.Lat, c.Lng = s.Provinces[pid].Lat, s.Provinces[pid].Lng
-			}
-			s.Cities = append(s.Cities, c)
-			cityByKode[kode] = id
-			s.CitiesByProvince[pid] = append(s.CitiesByProvince[pid], id)
-		case 2:
-			cid, ok := cityByKode[parent(kode)]
-			if !ok {
-				return nil, fmt.Errorf("orphan district %s", kode)
-			}
-			id := len(s.Districts)
-			s.Districts = append(s.Districts, District{ID: id, CityID: cid, Kode: kode, Name: name})
-			distByKode[kode] = id
-			s.DistrictsByCity[cid] = append(s.DistrictsByCity[cid], id)
-		case 3:
-			did, ok := distByKode[parent(kode)]
-			if !ok {
-				return nil, fmt.Errorf("orphan subdistrict %s", kode)
-			}
-			id := len(s.Subdistricts)
-			s.Subdistricts = append(s.Subdistricts, Subdistrict{ID: id, DistrictID: did, Kode: kode, Name: name, Zip: zip})
-			s.SubdistrictsByDistrict[did] = append(s.SubdistrictsByDistrict[did], id)
-		default:
-			return nil, fmt.Errorf("bad kode %q", kode)
+		s.Provinces = append(s.Provinces, p)
+	}
+	rows.Close()
+	if rows, err = db.Query(`SELECT id,province_id,kode,name,zip,lat,lng FROM city ORDER BY id`); err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var c City
+		if err = rows.Scan(&c.ID, &c.ProvinceID, &c.Kode, &c.Name, &c.Zip, &c.Lat, &c.Lng); err != nil {
+			rows.Close()
+			return nil, err
 		}
+		s.Cities = append(s.Cities, c)
+		s.CitiesByProvince[c.ProvinceID] = append(s.CitiesByProvince[c.ProvinceID], c.ID)
+	}
+	rows.Close()
+	if rows, err = db.Query(`SELECT id,city_id,kode,name,zip FROM district ORDER BY id`); err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var d District
+		if err = rows.Scan(&d.ID, &d.CityID, &d.Kode, &d.Name, &d.Zip); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		s.Districts = append(s.Districts, d)
+		s.DistrictsByCity[d.CityID] = append(s.DistrictsByCity[d.CityID], d.ID)
+	}
+	rows.Close()
+	if err = db.QueryRow(`SELECT count(*) FROM subdistrict`).Scan(&s.nSub); err != nil {
+		return nil, err
 	}
 
-	s.deriveZips()
-	s.buildLabels()
+	const cols = `id,district_id,kode,name,zip,label`
+	if s.byID, err = db.Prepare(`SELECT ` + cols + ` FROM subdistrict WHERE id=?`); err != nil {
+		return nil, err
+	}
+	if s.byDist, err = db.Prepare(`SELECT ` + cols + ` FROM subdistrict WHERE district_id=? ORDER BY id`); err != nil {
+		return nil, err
+	}
+	debug.FreeOSMemory()
 	return s, nil
 }
 
-func parent(kode string) string {
-	i := strings.LastIndex(kode, ".")
-	return kode[:i]
+type scanner interface{ Scan(...any) error }
+
+func scanSub(r scanner) (Subdistrict, error) {
+	var sd Subdistrict
+	err := r.Scan(&sd.ID, &sd.DistrictID, &sd.Kode, &sd.Name, &sd.Zip, &sd.Label)
+	return sd, err
 }
 
-// deriveZips sets district/city zips to the most frequent subdistrict zip
-// (ties: smallest string).
-func (s *Store) deriveZips() {
-	cityCounts := map[int]map[string]int{}
-	for i := 1; i < len(s.Districts); i++ {
-		d := &s.Districts[i]
-		counts := map[string]int{}
-		for _, sid := range s.SubdistrictsByDistrict[d.ID] {
-			counts[s.Subdistricts[sid].Zip]++
-		}
-		d.Zip = mostFrequent(counts)
-		cc := cityCounts[d.CityID]
-		if cc == nil {
-			cc = map[string]int{}
-			cityCounts[d.CityID] = cc
-		}
-		for z, n := range counts {
-			cc[z] += n
-		}
-	}
-	for i := 1; i < len(s.Cities); i++ {
-		s.Cities[i].Zip = mostFrequent(cityCounts[i])
-	}
+// Subdistrict returns one subdistrict by ID.
+func (s *Store) Subdistrict(id int) (Subdistrict, bool) {
+	sd, err := scanSub(s.byID.QueryRow(id))
+	return sd, err == nil
 }
 
-func mostFrequent(counts map[string]int) string {
-	keys := make([]string, 0, len(counts))
-	for k := range counts {
-		keys = append(keys, k)
+// SubdistrictsOf lists a district's subdistricts in ID order.
+func (s *Store) SubdistrictsOf(districtID int) ([]Subdistrict, error) {
+	rows, err := s.byDist.Query(districtID)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(keys)
-	best, bestN := "", 0
-	for _, k := range keys {
-		if counts[k] > bestN {
-			best, bestN = k, counts[k]
+	defer rows.Close()
+	var out []Subdistrict
+	for rows.Next() {
+		sd, err := scanSub(rows)
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, sd)
 	}
-	return best
-}
-
-func (s *Store) buildLabels() {
-	for i := 1; i < len(s.Subdistricts); i++ {
-		sd := &s.Subdistricts[i]
-		d := s.Districts[sd.DistrictID]
-		c := s.Cities[d.CityID]
-		p := s.Provinces[c.ProvinceID]
-		sd.Label = sd.Name + ", " + d.Name + ", " + c.Name + ", " + p.Name + ", " + sd.Zip
-		sd.labelLower = strings.ToLower(sd.Label)
-	}
+	return out, rows.Err()
 }
 
 // Hierarchy resolves a subdistrict ID to its ancestors.
 func (s *Store) Hierarchy(subID int) (Subdistrict, District, City, Province, bool) {
-	if subID < 1 || subID >= len(s.Subdistricts) {
+	sd, ok := s.Subdistrict(subID)
+	if !ok {
 		return Subdistrict{}, District{}, City{}, Province{}, false
 	}
-	sd := s.Subdistricts[subID]
 	d := s.Districts[sd.DistrictID]
 	c := s.Cities[d.CityID]
 	return sd, d, c, s.Provinces[c.ProvinceID], true
@@ -221,19 +289,48 @@ func (s *Store) DistrictChain(id int) (District, City, Province, bool) {
 	return d, c, s.Provinces[c.ProvinceID], true
 }
 
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 // Search returns subdistricts whose label contains q (case-insensitive),
 // in ascending ID order, after applying offset and limit. An offset past the
 // end of the matches is clamped so the last page of results is returned.
-func (s *Store) Search(q string, limit, offset int) []Subdistrict {
-	q = strings.ToLower(strings.TrimSpace(q))
-	var matches []Subdistrict
-	for i := 1; i < len(s.Subdistricts); i++ {
-		if strings.Contains(s.Subdistricts[i].labelLower, q) {
-			matches = append(matches, s.Subdistricts[i])
+// Plain queries of 3+ characters use the FTS5 trigram index; shorter ones, or
+// ones containing LIKE wildcards (which FTS5 cannot ESCAPE), scan.
+func (s *Store) Search(q string, limit, offset int) ([]Subdistrict, error) {
+	q = strings.TrimSpace(q)
+	var cond, pat string
+	if utf8.RuneCountInString(q) >= 3 && !strings.ContainsAny(q, `%_\`) {
+		cond = `s.id IN (SELECT rowid FROM subdistrict_fts WHERE label LIKE ?)`
+		pat = "%" + q + "%"
+	} else {
+		cond = `s.label LIKE ? ESCAPE '\'`
+		pat = "%" + likeEscaper.Replace(q) + "%"
+	}
+	page := func(off int) ([]Subdistrict, error) {
+		rows, err := s.db.Query(`SELECT s.id,s.district_id,s.kode,s.name,s.zip,s.label FROM subdistrict s WHERE `+
+			cond+` ORDER BY s.id LIMIT ? OFFSET ?`, pat, limit, off)
+		if err != nil {
+			return nil, err
 		}
+		defer rows.Close()
+		var out []Subdistrict
+		for rows.Next() {
+			sd, err := scanSub(rows)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sd)
+		}
+		return out, rows.Err()
 	}
-	if offset >= len(matches) {
-		offset = max(0, len(matches)-limit)
+	out, err := page(offset)
+	if err != nil || len(out) > 0 || offset == 0 {
+		return out, err
 	}
-	return matches[offset:min(len(matches), offset+limit)]
+	// Offset is past the end: clamp to the last page (needs the match count).
+	var total int
+	if err := s.db.QueryRow(`SELECT count(*) FROM subdistrict s WHERE `+cond, pat).Scan(&total); err != nil {
+		return nil, err
+	}
+	return page(max(0, total-limit))
 }
